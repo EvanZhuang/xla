@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tsl/platform/path.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/layout_util.h"
@@ -40,6 +41,7 @@ limitations under the License.
 #include "xla/tools/hlo_dump/hlo_dump_utils.h"
 #include "xla/tools/hlo_isolation/hlo_inf_nan_intent_analyzer.h"
 #include "xla/tools/hlo_isolation/hlo_isolation.pb.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/test.h"
 
 namespace xla {
@@ -645,6 +647,141 @@ ENTRY main {
     EXPECT_EQ(mismatch.mismatch_box_max(1), 1);
   }
   EXPECT_TRUE(found_interp_check);
+}
+
+// A main thread offload to SparseCore of a fusion.
+constexpr absl::string_view kSparseCoreHlo = R"hlo(
+HloModule sparse_core
+
+fused {
+  p0 = f32[4] parameter(0)
+  ROOT add = f32[4] add(p0, p0)
+}, execution_thread="sparsecore"
+
+wrapped {
+  p0 = f32[4] parameter(0)
+  ROOT fusion = f32[4] fusion(p0), kind=kLoop, calls=fused
+}, execution_thread="sparsecore"
+
+ENTRY main {
+  p0 = f32[4] parameter(0)
+  start = ((f32[4]), f32[4]) async-start(p0), async_execution_thread="sparsecore", calls=wrapped
+  ROOT done = f32[4] async-done(start)
+}
+)hlo";
+
+// Runs every module to `output`, failing the test if a defused module is
+// built. Counts runs that use the fusion debugger.
+decltype(ModuleIsolationOptions::run_module_fn) RunWithoutDefusing(
+    Literal output, int* fusion_debugger_runs) {
+  auto shared_output = std::make_shared<Literal>(std::move(output));
+  return [shared_output, fusion_debugger_runs](
+             std::unique_ptr<HloModule> m, HloRunnerInterface* r,
+             absl::Span<const Literal> i,
+             const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
+    EXPECT_FALSE(absl::StrContains(m->name(), "defused"));
+    *fusion_debugger_runs += run_opts.use_fusion_debugger;
+    if (r == FakeReferenceRunner()) {
+      return LiteralUtil::CreateR1<float>({0.0f, 0.0f, 0.0f, 0.0f});
+    }
+    return shared_output->Clone();
+  };
+}
+
+TEST(HloIsolationApiTest, IsSparseCoreModuleLooksForMainThreadOffloads) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> offload,
+                       xla::ParseAndReturnUnverifiedModule(kSparseCoreHlo));
+  EXPECT_TRUE(IsSparseCoreModule(*offload));
+
+  // An offload to another thread, and a SparseCore chain that is only
+  // started from another thread, do not count.
+  constexpr absl::string_view kHlo = R"hlo(
+HloModule m
+
+inner {
+  p0 = f32[4] parameter(0)
+  ROOT add = f32[4] add(p0, p0)
+}, execution_thread="sparsecore"
+
+wrapped {
+  p0 = f32[4] parameter(0)
+  start = ((f32[4]), f32[4]) async-start(p0), async_execution_thread="sparsecore", calls=inner
+  ROOT done = f32[4] async-done(start)
+}, execution_thread="other"
+
+ENTRY main {
+  p0 = f32[4] parameter(0)
+  start = ((f32[4]), f32[4]) async-start(p0), async_execution_thread="other", calls=wrapped
+  ROOT done = f32[4] async-done(start)
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> other,
+                       xla::ParseAndReturnUnverifiedModule(kHlo));
+  EXPECT_FALSE(IsSparseCoreModule(*other));
+}
+
+TEST(HloIsolationApiTest, SparseCoreModuleUsesInterpreterReference) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       xla::ParseAndReturnUnverifiedModule(kSparseCoreHlo));
+  int fusion_debugger_runs = 0;
+  ModuleIsolationOptions options;
+  options.run_module_fn =
+      RunWithoutDefusing(LiteralUtil::CreateR1<float>({0.0f, 0.0f, 0.0f, 0.0f}),
+                         &fusion_debugger_runs);
+
+  ASSERT_OK_AND_ASSIGN(HloIsolationTestResult result,
+                       RunIsolationTestOnModule(
+                           *module, nullptr, FakeReferenceRunner(), options));
+  EXPECT_EQ(result.state(), State::SUCCESS);
+  EXPECT_EQ(result.reason(), "STAGE_2_INTERPRETER_SUCCESS");
+}
+
+TEST(HloIsolationApiTest, SparseCoreModuleWithoutReferenceIsSkipped) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       xla::ParseAndReturnUnverifiedModule(kSparseCoreHlo));
+  int fusion_debugger_runs = 0;
+  ModuleIsolationOptions options;
+  options.run_module_fn =
+      RunWithoutDefusing(LiteralUtil::CreateR1<float>({0.0f, 0.0f, 0.0f, 0.0f}),
+                         &fusion_debugger_runs);
+
+  ASSERT_OK_AND_ASSIGN(
+      HloIsolationTestResult result,
+      RunIsolationTestOnModule(*module, nullptr, nullptr, options));
+  EXPECT_EQ(result.state(), State::SKIPPED);
+  EXPECT_EQ(result.reason(), "REFERENCE_UNAVAILABLE");
+}
+
+// TODO(b/527142533): Enable & test fusion debugger for SparseCore modules.
+TEST(HloIsolationApiTest, SparseCoreMismatchIsReportedWithoutFusionDebugger) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       xla::ParseAndReturnUnverifiedModule(kSparseCoreHlo));
+  int fusion_debugger_runs = 0;
+  ModuleIsolationOptions options;
+  options.run_module_fn =
+      RunWithoutDefusing(LiteralUtil::CreateR1<float>({1.0f, 1.0f, 1.0f, 1.0f}),
+                         &fusion_debugger_runs);
+  int mismatch_reports = 0;
+  options.on_mismatch_fn = [&](const HloModule&, const Literal&, const Literal&,
+                               const absl::Status&) { ++mismatch_reports; };
+
+  ASSERT_OK_AND_ASSIGN(HloIsolationTestResult result,
+                       RunIsolationTestOnModule(
+                           *module, nullptr, FakeReferenceRunner(), options));
+  EXPECT_EQ(result.state(), State::FAILURE);
+  EXPECT_EQ(result.reason(), "NUMERIC_MISMATCH");
+  EXPECT_EQ(mismatch_reports, 1);
+  EXPECT_EQ(fusion_debugger_runs, 0);
+
+  std::string outputs_dir;
+  ASSERT_TRUE(tsl::io::GetTestUndeclaredOutputsDir(&outputs_dir));
+  std::string html;
+  ASSERT_OK(tsl::ReadFileToString(
+      tsl::Env::Default(),
+      tsl::io::JoinPath(outputs_dir, "failed-module-sparse_core.html"), &html));
+  EXPECT_TRUE(absl::StrContains(html, "window.compressedGraphData"));
+  EXPECT_TRUE(absl::StrContains(html, "Numeric Mismatch:"));
+  EXPECT_TRUE(absl::StrContains(html, "done"));
 }
 
 }  // namespace
