@@ -157,8 +157,6 @@ def internal_visibility(internal_targets, or_else = ["//visibility:public"]):
 # TODO(jakeharmon): Use this to replace if_static
 # TODO(b/356020232): remove completely after migration is done
 def if_tsl_link_protobuf(if_true, if_false = []):
-    if use_pywrap_rules():
-        return if_true
     return select({
         "//conditions:default": if_true,
         clean_dep("//xla/tsl:tsl_protobuf_header_only"): if_false,
@@ -536,22 +534,14 @@ def transitive_hdrs(name, deps = [], **kwargs):
     native.filegroup(name = name, srcs = [":" + name + "_gather"], **kwargs)
 
 def cc_header_only_library(name, deps = [], includes = [], extra_deps = [], compatible_with = None, **kwargs):
-    if use_pywrap_rules():
-        cc_library(
-            name = name,
-            deps = deps + extra_deps,
-            compatible_with = compatible_with,
-            **kwargs
-        )
-    else:
-        custom_op_cc_header_only_library(
-            name,
-            deps,
-            includes,
-            extra_deps,
-            compatible_with,
-            **kwargs
-        )
+    custom_op_cc_header_only_library(
+        name,
+        deps,
+        includes,
+        extra_deps,
+        compatible_with,
+        **kwargs
+    )
 
 # Create a header only library that includes all the headers exported by
 # the libraries in deps.

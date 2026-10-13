@@ -125,9 +125,6 @@ def tf_additional_tpu_ops_deps():
 # used for all framework_shared_object platforms including MacOS.
 # buildifier: disable=function-docstring
 def if_static(extra_deps, otherwise = [], macos = []):
-    if use_pywrap_rules():
-        return extra_deps
-
     ret = {
         str(Label("//xla/tsl:framework_shared_object")): otherwise,
         "//conditions:default": extra_deps,
@@ -138,9 +135,6 @@ def if_static(extra_deps, otherwise = [], macos = []):
 
 # TODO(b/356020232): remove completely after migration is done
 def if_static_and_not_mobile(extra_deps, otherwise = []):
-    if use_pywrap_rules():
-        return extra_deps
-
     return select({
         str(Label("//xla/tsl:framework_shared_object")): otherwise,
         str(Label("//xla/tsl:android")): otherwise,
