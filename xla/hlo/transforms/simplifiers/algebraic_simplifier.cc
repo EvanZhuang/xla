@@ -57,6 +57,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/hlo/ir/hlo_original_value_util.h"
 #include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/hlo/pass/hlo_pass_options.h"
 #include "xla/hlo/transforms/simplifiers/conv_operand_swapper.h"
 #include "xla/hlo/utils/hlo_sharding_util.h"
 #include "xla/layout.h"
@@ -11256,6 +11258,75 @@ bool AlgebraicSimplifierVisitor::ShouldStrengthReduceDotToReduce(
            rhs_has_only_batch_and_contracting;
   }
   return true;
+}
+
+namespace {
+
+struct BoolOption {
+  absl::string_view key;
+  void (AlgebraicSimplifierOptions::*set)(bool);
+  bool (AlgebraicSimplifierOptions::*get)() const;
+};
+
+#define ALGSIMP_BOOL_OPTION(name)                  \
+  {#name, &AlgebraicSimplifierOptions::set_##name, \
+   &AlgebraicSimplifierOptions::name}
+
+constexpr BoolOption kBoolOptions[] = {
+    ALGSIMP_BOOL_OPTION(is_layout_sensitive),
+    ALGSIMP_BOOL_OPTION(enable_dot_strength_reduction),
+    ALGSIMP_BOOL_OPTION(supports_non_canonical_dots),
+    ALGSIMP_BOOL_OPTION(enable_dot_to_multiply_rewrite),
+    ALGSIMP_BOOL_OPTION(enable_move_dot_param_to_rhs),
+    ALGSIMP_BOOL_OPTION(enable_conv_simplification),
+    ALGSIMP_BOOL_OPTION(enable_conv_operand_swap),
+    ALGSIMP_BOOL_OPTION(enable_conv_add_multiply_reorder),
+    ALGSIMP_BOOL_OPTION(enable_scalar_multiply_reduction),
+    ALGSIMP_BOOL_OPTION(enable_floats_are_real),
+    ALGSIMP_BOOL_OPTION(enable_window_reduce_to_reduce_replacement),
+    ALGSIMP_BOOL_OPTION(enable_reduce_of_reshape),
+    ALGSIMP_BOOL_OPTION(enable_negative_padding_replacement),
+    ALGSIMP_BOOL_OPTION(enable_dynamic_update_slice_to_pad_replacement),
+    ALGSIMP_BOOL_OPTION(enable_sink_broadcast),
+    ALGSIMP_BOOL_OPTION(
+        unconditionally_simplify_reduce_of_transpose_or_reshape),
+    ALGSIMP_BOOL_OPTION(minmax_propagate_nan),
+    ALGSIMP_BOOL_OPTION(enable_unconditional_reduce_of_concat_replacement),
+    ALGSIMP_BOOL_OPTION(executing_on_cpu),
+    ALGSIMP_BOOL_OPTION(use_associative_reordering),
+    ALGSIMP_BOOL_OPTION(raise_slice_and_reduce_through_dot),
+    ALGSIMP_BOOL_OPTION(use_convert_constant_folding),
+    ALGSIMP_BOOL_OPTION(disable_dynamic_slice_to_slice_conversion),
+    ALGSIMP_BOOL_OPTION(enable_fast_math),
+    ALGSIMP_BOOL_OPTION(enable_broadcast_degenerate_dimension),
+    ALGSIMP_BOOL_OPTION(enable_remove_no_op_reduce_precision),
+    ALGSIMP_BOOL_OPTION(enable_onednn_support),
+    ALGSIMP_BOOL_OPTION(rewrite_reshape_transpose_as_slice_concatenate),
+    ALGSIMP_BOOL_OPTION(run_to_fixed_point),
+    ALGSIMP_BOOL_OPTION(rewrite_no_op_bitcast_convert_to_bitcast),
+    ALGSIMP_BOOL_OPTION(enable_conditional_simplification),
+    ALGSIMP_BOOL_OPTION(enable_hoist_transpose_of_reshape),
+    ALGSIMP_BOOL_OPTION(enable_fold_transpose_into_scatter),
+    ALGSIMP_BOOL_OPTION(enable_folding_pad_into_convolution),
+};
+
+#undef ALGSIMP_BOOL_OPTION
+
+}  // namespace
+
+absl::StatusOr<AlgebraicSimplifierOptions>
+AlgebraicSimplifierOptions::FromHloPassOptions(
+    const HloPassOptions& options, AlgebraicSimplifierOptions base) {
+  for (const BoolOption& opt : kBoolOptions) {
+    ABSL_ASSIGN_OR_RETURN(bool value,
+                          options.Get<bool>(opt.key, (base.*opt.get)()));
+    (base.*opt.set)(value);
+  }
+  ABSL_ASSIGN_OR_RETURN(int64_t gather_size,
+                        options.Get<int64_t>("very_small_gather_size",
+                                             base.very_small_gather_size()));
+  base.set_very_small_gather_size(gather_size);
+  return base;
 }
 
 }  // namespace xla

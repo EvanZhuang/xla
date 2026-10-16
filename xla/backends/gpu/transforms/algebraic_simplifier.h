@@ -73,6 +73,8 @@ class GpuAlgebraicSimplifier : public AlgebraicSimplifier {
       : AlgebraicSimplifier(options),
         compute_capability_(std::move(compute_capability)) {}
 
+  absl::string_view name() const override { return "gpu-algebraic-simplifier"; }
+
  protected:
   absl::StatusOr<bool> RunImpl(
       HloModule* module,
@@ -81,6 +83,10 @@ class GpuAlgebraicSimplifier : public AlgebraicSimplifier {
  private:
   se::GpuComputeCapability compute_capability_;
 };
+
+// Returns the options shared by every GpuAlgebraicSimplifier invocation.
+// HloPassOptions of "gpu-algebraic-simplifier" are relative to these.
+AlgebraicSimplifierOptions GpuAlgebraicSimplifierBaseOptions();
 
 }  // namespace xla::gpu
 

@@ -38,6 +38,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/hlo/pass/hlo_pass_options.h"
 #include "xla/literal.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -65,6 +66,13 @@ class AlgebraicSimplifierOptions {
       ConvIsLowerableCallback conv_is_lowerable_callback = {})
       : reshape_is_bitcast_callback_(std::move(reshape_is_bitcast_callback)),
         conv_is_lowerable_callback_(std::move(conv_is_lowerable_callback)) {}
+
+  // Applies `options` on top of `base`. Keys are the setter names without the
+  // `set_` prefix; only bool and int64 fields are supported. Unknown keys are
+  // left unconsumed for the caller's `CheckAllConsumed()`.
+  static absl::StatusOr<AlgebraicSimplifierOptions> FromHloPassOptions(
+      const HloPassOptions& options,
+      AlgebraicSimplifierOptions base = AlgebraicSimplifierOptions());
 
   // Use the platform specific callback if set. It is not sensible to return
   // true here if the options are not layout sensitive.
