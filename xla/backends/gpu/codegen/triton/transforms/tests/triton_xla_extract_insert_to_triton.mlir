@@ -655,3 +655,32 @@ func.func @extract_with_transposing_layout(
 // CHECK-TMA:         %[[TRANS:.*]] = tt.trans %[[LOAD]]
 // CHECK-TMA-SAME:        tensor<64x2x128xbf16> -> tensor<2x64x128xbf16>
 // CHECK-TMA:         tt.descriptor_store %arg1[{{.*}}], %[[TRANS]]
+
+// -----
+
+#indexing_map_concat_rhs = #xla.indexing_map<"(pid) -> ((pid mod 12) * 128 - 1024), domain: pid in [0, 95], pid mod 12 in [8, 11]">
+module {
+  func.func @extract_with_indexing_map_constraint_has_no_mask(
+      %arg0: !tt.ptr<i8>, %arg1: !tt.ptr<i8>) {
+    %0 = tt.get_program_id x : i32
+    %1 = arith.index_cast %0 : i32 to index
+    // Without the `pid mod 12 in [8, 11]` constraint, the indexing map range is
+    // [-1024, 384], which would require both lower and upper bounds masks for a
+    // dimension of size 512. With the constraint, the range is [0, 384], so the
+    // slice [offset, offset + 128) is guaranteed to be within [0, 512) and no
+    // mask is needed.
+    %2 = xla.apply_indexing #indexing_map_concat_rhs(%1)
+    %extracted_tile = triton_xla.extract from %arg0
+        as memref<10240x512xi8, #xtile.layout<[1, 0]>>
+        [0, %2] [64, 128] [1, 1] : tensor<64x128xi8>
+    triton_xla.insert %extracted_tile into %arg1
+        as memref<10240x512xi8, #xtile.layout<[1, 0]>>
+        [0, %2] [64, 128] [1, 1] : tensor<64x128xi8>
+    func.return
+  }
+}
+
+// CHECK-LABEL: tt.func @extract_with_indexing_map_constraint_has_no_mask
+// CHECK-NOT:     arith.cmpi
+// CHECK:         %[[LOAD:.*]] = tt.load %{{.*}} : tensor<64x128x!tt.ptr<i8>>
+// CHECK:         tt.store %{{.*}}, %[[LOAD]] : tensor<64x128x!tt.ptr<i8>>
