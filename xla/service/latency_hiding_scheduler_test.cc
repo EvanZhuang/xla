@@ -3716,6 +3716,84 @@ ENTRY AddR2 {
   XLA_VLOG_LINES(1, hlo_module->ToString());
 }
 
+// Two dependent layers each offload their result to host. Both copy-dones only
+// feed the ROOT tuple, so every other heuristic ties and, without a dedicated
+// tie-breaker, the original order would decide. The input deliberately lists
+// layer1's copy-done before layer0's. Since layer0 (copied by copy-start.0)
+// feeds copy-start.1, the scheduler should complete layer0's offload first, so
+// that its buffer is released as early as possible and the offloads finish in
+// dependency order.
+TEST_F(LatencyHidingSchedulerTest,
+       DependentLayerOffloadDonesOrderedByDependency) {
+  absl::string_view hlo_string = R"(
+HloModule DependentLayerOffload, is_scheduled=true
+ENTRY main {
+  x = f32[16,16]{1,0} parameter(0)
+  w0 = f32[16,16]{1,0} parameter(1)
+  w1 = f32[16,16]{1,0} parameter(2)
+  layer0 = f32[16,16]{1,0} convolution(x, w0), dim_labels=bf_io->bf
+  copy-start.0 = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0}, u32[]) copy-start(layer0)
+  layer1 = f32[16,16]{1,0} convolution(layer0, w1), dim_labels=bf_io->bf
+  copy-start.1 = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0}, u32[]) copy-start(layer1)
+  copy-done.1 = f32[16,16]{1,0:S(5)} copy-done(copy-start.1)
+  copy-done.0 = f32[16,16]{1,0:S(5)} copy-done(copy-start.0)
+  ROOT t = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0:S(5)}) tuple(copy-done.0, copy-done.1)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(auto hlo_module, ParseHloText(hlo_string));
+  HloSchedule& module_schedule = hlo_module->schedule();
+  HloComputation* entry_computation = hlo_module->entry_computation();
+  EXPECT_OK(RunScheduler(hlo_module.get(), GetDefaultSchedConfig()));
+  std::vector<HloInstruction*> new_instruction_sequence =
+      module_schedule.sequence(entry_computation).instructions();
+  XLA_VLOG_LINES(1, hlo_module->ToString());
+
+  // Each offload overlaps with compute.
+  EXPECT_LT(GetIndex(new_instruction_sequence, "copy-start.0"),
+            GetIndex(new_instruction_sequence, "layer1"));
+  EXPECT_LT(GetIndex(new_instruction_sequence, "layer1"),
+            GetIndex(new_instruction_sequence, "copy-done.0"));
+  // The offload of the earlier-produced data (layer0) completes first.
+  EXPECT_LT(GetIndex(new_instruction_sequence, "copy-done.0"),
+            GetIndex(new_instruction_sequence, "copy-done.1"));
+}
+
+// Two independent layers each offload their result to host. There is no data
+// dependency between the offloads, so the dependency tie-breaker must not
+// apply and the copy-dones keep their original relative order, even though
+// layer1 is deeper in the graph than layer0.
+TEST_F(LatencyHidingSchedulerTest,
+       IndependentLayerOffloadDonesKeepOriginalOrder) {
+  absl::string_view hlo_string = R"(
+HloModule IndependentLayerOffload, is_scheduled=true
+ENTRY main {
+  x = f32[16,16]{1,0} parameter(0)
+  w0 = f32[16,16]{1,0} parameter(1)
+  w1 = f32[16,16]{1,0} parameter(2)
+  layer0 = f32[16,16]{1,0} convolution(x, w0), dim_labels=bf_io->bf
+  copy-start.0 = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0}, u32[]) copy-start(layer0)
+  pre1 = f32[16,16]{1,0} convolution(x, w1), dim_labels=bf_io->bf
+  layer1 = f32[16,16]{1,0} convolution(pre1, w1), dim_labels=bf_io->bf
+  copy-start.1 = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0}, u32[]) copy-start(layer1)
+  copy-done.1 = f32[16,16]{1,0:S(5)} copy-done(copy-start.1)
+  copy-done.0 = f32[16,16]{1,0:S(5)} copy-done(copy-start.0)
+  ROOT t = (f32[16,16]{1,0:S(5)}, f32[16,16]{1,0:S(5)}) tuple(copy-done.0, copy-done.1)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(auto hlo_module, ParseHloText(hlo_string));
+  HloSchedule& module_schedule = hlo_module->schedule();
+  HloComputation* entry_computation = hlo_module->entry_computation();
+  EXPECT_OK(RunScheduler(hlo_module.get(), GetDefaultSchedConfig()));
+  std::vector<HloInstruction*> new_instruction_sequence =
+      module_schedule.sequence(entry_computation).instructions();
+  XLA_VLOG_LINES(1, hlo_module->ToString());
+
+  EXPECT_LT(GetIndex(new_instruction_sequence, "copy-done.1"),
+            GetIndex(new_instruction_sequence, "copy-done.0"));
+}
+
 TEST_F(LatencyHidingSchedulerTest, ScheduleLoopPeeledSendDoneBeforeWhile) {
   absl::string_view hlo_string = R"(
 HloModule module, is_scheduled=true

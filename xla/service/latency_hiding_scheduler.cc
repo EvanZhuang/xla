@@ -2046,6 +2046,35 @@ bool ReadySetLt::AIsBetterThanB(DefaultSchedulerCore::ScheduleCandidate& a,
     }
   }
 
+  // Tie-breaker for two ready async-done operations: if an input of one's
+  // async-start is an ancestor of the other's async-start (e.g. two dependent
+  // layers each offloading their result to host), the done transferring the
+  // earlier-produced data completes first in program order. Unrelated
+  // async-dones keep their original order.
+  if (an->IsSupportedAsyncDone() && bn->IsSupportedAsyncDone() &&
+      sched_state.async_tracker->IsSupportedAsyncStart(
+          *an->GetInstr().operand(0)) &&
+      sched_state.async_tracker->IsSupportedAsyncStart(
+          *bn->GetInstr().operand(0))) {
+    const HloReachabilityMap& reachability =
+        sched_state.sched_graph->reachability();
+    auto transfers_earlier_data = [&](const HloGraphNode* x,
+                                      const HloGraphNode* y) {
+      const HloInstruction* x_start = x->GetInstr().operand(0);
+      const HloInstruction* y_start = y->GetInstr().operand(0);
+      return absl::c_any_of(x_start->operands(),
+                            [&](const HloInstruction* operand) {
+                              return reachability.IsReachable(operand, y_start);
+                            });
+    };
+    if (auto res = CmpDirectional(core_->top_down_scheduling_,
+                                  transfers_earlier_data(an, bn),
+                                  transfers_earlier_data(bn, an),
+                                  "kAsyncDoneDataDependency", reason)) {
+      return *res;
+    }
+  }
+
   *reason = "kOriginalOrder";
   return core_->top_down_scheduling_
              ? (an->GetOriginalPosition() < bn->GetOriginalPosition())
