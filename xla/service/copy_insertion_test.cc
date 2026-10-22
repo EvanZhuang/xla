@@ -82,6 +82,7 @@ class CopyInsertionTestPeer {
 
 namespace {
 
+using ::testing::IsEmpty;
 using ::testing::NotNull;
 using ::testing::UnorderedElementsAre;
 
@@ -3579,6 +3580,85 @@ ENTRY main {
   EXPECT_EQ(CountCopies(*module), 1);
   EXPECT_THAT(module->entry_computation()->root_instruction(),
               op::Scatter(op::Copy(op::Iota()), op::Fusion(), op::Iota()));
+}
+
+TEST_F(CopyInsertionTest, InPlaceCopyIsOrderedAfterPredecessorReaders) {
+  // `g` reads the scatter operand and is a predecessor of the scatter, so it
+  // must execute before the scatter anyway. Ordering it before the copy that
+  // is added for the scatter operand lets copy removal prove that the copy is
+  // redundant even when other in-place copies of the same buffer are present,
+  // e.g. for chains of gather-then-scatter updates of a loop-carried table.
+  // `n` also reads the operand but is not a predecessor of the scatter, so it
+  // must not be ordered before the copy.
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+assign {
+  lhs = f32[] parameter(0)
+  ROOT rhs = f32[] parameter(1)
+}
+
+ENTRY main {
+  t = f32[8,4] parameter(0)
+  idx = s32[2,1] parameter(1)
+  upd = f32[2,4] parameter(2)
+  g = f32[2,4] gather(t, idx), offset_dims={1}, collapsed_slice_dims={0},
+      start_index_map={0}, index_vector_dim=1, slice_sizes={1,4}
+  new_rows = f32[2,4] add(g, upd)
+  n = f32[8,4] negate(t)
+  t_next = f32[8,4] scatter(t, idx, new_rows), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+  ROOT out = (f32[8,4], f32[8,4]) tuple(t_next, n)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  copy_insertion.set_order_predecessor_readers_before_in_place_copies(true);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+
+  HloComputation* entry = module->entry_computation();
+  const HloInstruction* scatter = entry->GetInstructionWithName("t_next");
+  ASSERT_THAT(scatter, op::Scatter(op::Copy(op::Parameter(0)), op::Parameter(1),
+                                   op::Add()));
+  EXPECT_THAT(scatter->operand(0)->control_predecessors(),
+              UnorderedElementsAre(entry->GetInstructionWithName("g")));
+}
+
+TEST_F(CopyInsertionTest, InPlaceCopyIsNotOrderedAfterReadersByDefault) {
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+assign {
+  lhs = f32[] parameter(0)
+  ROOT rhs = f32[] parameter(1)
+}
+
+ENTRY main {
+  t = f32[8,4] parameter(0)
+  idx = s32[2,1] parameter(1)
+  upd = f32[2,4] parameter(2)
+  g = f32[2,4] gather(t, idx), offset_dims={1}, collapsed_slice_dims={0},
+      start_index_map={0}, index_vector_dim=1, slice_sizes={1,4}
+  new_rows = f32[2,4] add(g, upd)
+  ROOT t_next = f32[8,4] scatter(t, idx, new_rows), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+
+  const HloInstruction* scatter =
+      module->entry_computation()->GetInstructionWithName("t_next");
+  ASSERT_THAT(scatter, op::Scatter(op::Copy(op::Parameter(0)), op::Parameter(1),
+                                   op::Add()));
+  EXPECT_THAT(scatter->operand(0)->control_predecessors(), IsEmpty());
 }
 
 TEST_F(CopyInsertionTest, VariadicScatterSharedOperand) {
