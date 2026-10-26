@@ -325,6 +325,9 @@ CUptiResult CuptiErrorManager::Subscribe(CUpti_SubscriberHandle* subscriber,
     auto f = std::bind(&CuptiErrorManager::Unsubscribe, this, *subscriber);
     RegisterUndoFunction(f);
   }
+  ALLOW_ERROR(error, CUPTI_ERROR_INSUFFICIENT_PRIVILEGES);
+  ALLOW_ERROR(error, CUPTI_ERROR_MAX_LIMIT_REACHED);
+  ALLOW_ERROR(error, CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED);
   LOG_AND_DISABLE_IF_ERROR(error);
   return error;
 }
@@ -343,6 +346,9 @@ CUptiResult CuptiErrorManager::SubscribeV2(CUpti_SubscriberHandle* subscriber,
   ALLOW_ERROR(error, CUPTI_ERROR_NOT_SUPPORTED);
   ALLOW_ERROR(error, CUPTI_ERROR_NOT_COMPATIBLE);
   ALLOW_ERROR(error, CUPTI_ERROR_UNKNOWN);
+  ALLOW_ERROR(error, CUPTI_ERROR_INSUFFICIENT_PRIVILEGES);
+  ALLOW_ERROR(error, CUPTI_ERROR_MAX_LIMIT_REACHED);
+  ALLOW_ERROR(error, CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED);
   LOG_AND_DISABLE_IF_ERROR(error);
   return error;
 }

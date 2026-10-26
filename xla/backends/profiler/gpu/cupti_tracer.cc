@@ -1208,6 +1208,9 @@ absl::Status CuptiTracer::Enable(
       *option_, cupti_interface_, this);
 
   absl::Cleanup api_tracing_cleanup = [&] {
+    if (api_tracing_enabled_) {
+      GatherCallbackAnnotationsAndEvents(/*stop_recording=*/true);
+    }
     if (cupti_interface_->Disabled()) {
       api_tracing_enabled_ = false;
       // A subscriber created by this session is owned by the error manager
@@ -1218,6 +1221,9 @@ absl::Status CuptiTracer::Enable(
     }
     using_v2_subscriber_api_ = false;
     cupti_interface_->CleanUp();
+    collector_ = nullptr;
+    option_.reset();
+    cupti_driver_api_hook_.reset();
   };
 
   tsl::profiler::AnnotationStack::Enable(true);
@@ -1285,6 +1291,26 @@ absl::Status CuptiTracer::Enable(
 }
 
 void CuptiTracer::Disable() {
+  if (!api_tracing_enabled_ && !activity_tracing_enabled_ &&
+      !pm_sampling_enabled_) {
+    if (subscriber_ != nullptr) {
+      if (cupti_interface_->Disabled()) {
+        ClearSubscriberState();
+      } else {
+        UnsubscribeAndClearSubscriber().IgnoreError();
+      }
+      cupti_interface_->CleanUp();
+    }
+    annotation_harvest_hold_.reset();
+    collector_ = nullptr;
+    option_.reset();
+    cupti_driver_api_hook_.reset();
+    using_v2_subscriber_api_ = false;
+    subscriber_prepared_for_current_session_ = false;
+    tsl::profiler::AnnotationStack::Enable(false);
+    return;
+  }
+
   // Disables the PM Sampling before Cupti Tracer is disabled.
   if (pm_sampling_enabled_) {
     if (absl::Status status = cupti_pm_sampler_->StopSampler(); !status.ok()) {
@@ -1595,10 +1621,24 @@ absl::Status CuptiTracer::PrepareSubscriberForSession(
     }
   }
   if (ABSL_PREDICT_FALSE(subscribe_status != CUPTI_SUCCESS)) {
+    ClearSubscriberState();
     const char* errstr = "";
     cupti_interface_->GetResultString(subscribe_status, &errstr);
+    if (subscribe_status == CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED ||
+        subscribe_status == CUPTI_ERROR_MAX_LIMIT_REACHED) {
+      LOG(WARNING)
+          << "Skip enabling CUPTI tracer for this profiling session because an "
+             "external CUPTI subscriber (such as Nsight Systems or Nsight "
+             "Compute) is active: "
+          << errstr;
+      return absl::UnavailableError(absl::StrCat(
+          "Cannot enable CUPTI tracer because another CUPTI subscriber (such "
+          "as Nsight Systems or Nsight Compute) is active: ",
+          errstr));
+    }
     LOG(ERROR) << "function Subscribe failed with error " << errstr;
     if (subscribe_status == CUPTI_ERROR_INSUFFICIENT_PRIVILEGES) {
+      need_root_access_ = true;
       return absl::PermissionDeniedError("CUPTI needs root access");
     }
     return absl::InternalError(absl::StrCat("CUPTI call error: ", errstr));
@@ -1613,9 +1653,9 @@ absl::Status CuptiTracer::EnableApiTracing() {
     return absl::OkStatus();
   }
 
-  PrepareCallbackStart();
   using_v2_subscriber_api_ = false;
   ABSL_RETURN_IF_ERROR(PrepareSubscriberForSession(*option_));
+  PrepareCallbackStart();
   using_v2_subscriber_api_ = subscriber_is_v2_;
   api_tracing_enabled_ = true;
 
