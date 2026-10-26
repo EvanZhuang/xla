@@ -325,12 +325,22 @@ PjRtStreamExecutorRawClient::PjRtStreamExecutorRawClient(
 }
 
 PjRtStreamExecutorRawClient::~PjRtStreamExecutorRawClient() {
-  // Properly quiesce async_dispatch_thread on all local devices.
+  // Drain the dispatch threads on all local devices before resetting
+  // async_work_runner_, since tasks on those threads may reference
+  // async_work_runner_. The threads are drained rather than joined so that
+  // in-flight async_work_runner_ tasks can still schedule work onto them; they
+  // are joined by LocalDeviceState::Destroy() below.
   for (const auto& local_device_state : local_device_states_) {
-    if (local_device_state != nullptr &&
-        local_device_state->async_dispatch_thread() != nullptr) {
-      local_device_state->async_dispatch_thread()->Drain();
-    }
+    local_device_state->DrainDispatchThreads();
+  }
+  // Stop async_work_runner_ before destroying streams so in-flight staged
+  // transfer tasks finish enqueueing onto device streams.
+  async_work_runner_.reset();
+  // Destroy streams and worker threads on all local devices so all in-flight
+  // host staging buffers are released before host_memory_allocator_ is
+  // destroyed.
+  for (const auto& local_device_state : local_device_states_) {
+    local_device_state->Destroy();
   }
 }
 
