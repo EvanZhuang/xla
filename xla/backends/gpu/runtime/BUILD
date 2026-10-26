@@ -219,6 +219,7 @@ cc_library(
     srcs = ["traced_command.cc"],
     hdrs = ["traced_command.h"],
     deps = [
+        ":annotation",
         ":command",
         ":command_state",
         ":thunk",
@@ -232,6 +233,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@tsl//tsl/profiler/lib:scoped_annotation",
     ],
 )
 
@@ -256,6 +258,8 @@ xla_cc_test(
         "//xla/stream_executor:mock_command_buffer",
         "//xla/tsl/platform:test",
         "//xla/tsl/platform:test_main",
+        "//xla/tsl/profiler/backends/cpu:annotation_stack",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
@@ -278,6 +282,7 @@ xla_test(
         ":memset_thunk",
         ":shaped_slice",
         ":thunk",
+        ":traced_command",
         ":traced_command_buffer",
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
@@ -304,7 +309,9 @@ xla_test(
         "//xla/tsl/platform:test",
         "//xla/tsl/platform:test_benchmark",
         "//xla/tsl/platform:test_main",
+        "//xla/tsl/profiler/backends/cpu:annotation_stack",
         "//xla/tsl/util:safe_reinterpret_cast",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
