@@ -43,8 +43,9 @@ TEST(FfiTest, RecordStage) {
         EXPECT_EQ(ctx.commands().capacity(), 10);
         EXPECT_EQ(ctx.commands().size(), 0);
         auto cmd = ctx.CreateLaunch(
-            /*kernel_name=*/"test", /*kernel_data=*/"dummy_ptx",
-            /*kernel_size=*/9, /*format=*/SourceFormat::kPtx,
+            /*kernel_name=*/"test",
+            /*kernel_data=*/reinterpret_cast<const void*>(0xDEADBEEF),
+            /*kernel_size=*/0, /*format=*/SourceFormat::kFunctionPtr,
             /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}}, /*shared_mem_bytes=*/0,
             /*uses_pdl=*/false, /*args=*/std::vector<KernelArg>{});
         return Error::Success();
@@ -91,7 +92,7 @@ TEST(FfiTest, CreateLaunchWithFunctionPtr) {
   struct CaptureState {
     const void* kernel_data = nullptr;
     int64_t kernel_size = -1;
-    XLA_FFI_SourceFormat format = XLA_FFI_SourceFormat_PTX;
+    XLA_FFI_SourceFormat format = static_cast<XLA_FFI_SourceFormat>(-1);
     const XLA_FFI_Command* dummy_cmd =
         reinterpret_cast<const XLA_FFI_Command*>(0x1);
   } state;

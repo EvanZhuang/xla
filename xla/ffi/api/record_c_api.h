@@ -20,6 +20,7 @@ limitations under the License.
 #include <stdint.h>
 
 #include "xla/ffi/api/c_api.h"
+#include "xla/ffi/api/kernel_c_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,7 +42,7 @@ extern "C" {
 //==============================================================================
 #define XLA_FFI_Extension_Record 128
 #define XLA_FFI_Extension_Record_MajorVersion 0
-#define XLA_FFI_Extension_Record_MinorVersion 2
+#define XLA_FFI_Extension_Record_MinorVersion 3
 
 //===----------------------------------------------------------------------===//
 // Command Buffer Recording API (FFI Record)
@@ -60,45 +61,6 @@ typedef enum XLA_FFI_RecordAction {
   XLA_FFI_RecordAction_Create = 0,
   XLA_FFI_RecordAction_Update = 1,
 } XLA_FFI_RecordAction;
-
-typedef enum XLA_FFI_SourceFormat {
-  XLA_FFI_SourceFormat_PTX = 0,
-  XLA_FFI_SourceFormat_CUBIN = 1,
-  XLA_FFI_SourceFormat_FUNCTION_PTR = 2,
-} XLA_FFI_SourceFormat;
-
-typedef struct XLA_FFI_Dim3 {
-  int32_t x;
-  int32_t y;
-  int32_t z;
-} XLA_FFI_Dim3;
-
-typedef struct XLA_FFI_LaunchDims {
-  XLA_FFI_Dim3 grid;
-  XLA_FFI_Dim3 block;
-  // Cluster dims are optional, 0, 0, 0 is considered as no cluster dims.
-  XLA_FFI_Dim3 cluster;
-} XLA_FFI_LaunchDims;
-
-typedef enum XLA_FFI_KernelArgType {
-  XLA_FFI_KernelArgType_DevicePtr = 0,
-  XLA_FFI_KernelArgType_HostValue = 1,
-} XLA_FFI_KernelArgType;
-
-// A kernel argument is either a pointer to a device buffer or a host value.
-// For a pointer to a device buffer, the size must be 0.
-// For a host value, the size must be non-zero. In this case, XLA will pass the
-// argument by value to the kernel.
-typedef struct XLA_FFI_KernelArg {
-  const void* arg_address;
-  int64_t size;
-  XLA_FFI_KernelArgType type;
-} XLA_FFI_KernelArg;
-
-typedef struct XLA_FFI_KernelArgs {
-  const XLA_FFI_KernelArg* args;
-  int64_t num_args;
-} XLA_FFI_KernelArgs;
 
 // API for recording kernel invocations for FFI clients.
 // Usage:

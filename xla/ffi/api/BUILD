@@ -54,6 +54,8 @@ filegroup(
         "collectives_c_api.h",
         "collectives_ffi.h",
         "ffi.h",
+        "kernel_api.h",
+        "kernel_c_api.h",
         "record_api.h",
         "record_c_api.h",
         "record_ffi.h",
@@ -65,6 +67,7 @@ filegroup(
     srcs = [
         "api.h",
         "collectives_api.h",
+        "kernel_api.h",
         "record_api.h",
     ],
 )
@@ -74,6 +77,7 @@ filegroup(
     srcs = [
         "c_api.h",
         "collectives_c_api.h",
+        "kernel_c_api.h",
         "record_c_api.h",
     ],
 )
@@ -108,11 +112,29 @@ cc_library(
 )
 
 cc_library(
+    name = "kernel_c_api",
+    hdrs = ["kernel_c_api.h"],
+    deps = [
+        ":c_api",
+    ],
+)
+
+cc_library(
+    name = "kernel_api",
+    hdrs = ["kernel_api.h"],
+    deps = [
+        ":c_api",
+        ":kernel_c_api",
+    ],
+)
+
+cc_library(
     name = "record_api",
     hdrs = ["record_api.h"],
     deps = [
         ":api",
         ":c_api",
+        ":kernel_api",
     ],
 )
 

@@ -112,8 +112,9 @@ TEST(FfiTest, RecordStageCreateAndUpdateCommands) {
         if (action == RecordAction::kCreate) {
           XLA_FFI_LaunchDims dims{{1, 1, 1}, {1, 1, 1}};
           auto launch_cmd = ctx.CreateLaunch(
-              /*kernel_name=*/"dummy_kernel", /*kernel_data=*/"dummy_ptx",
-              /*kernel_size=*/9, /*format=*/SourceFormat::kPtx,
+              /*kernel_name=*/"dummy_kernel",
+              /*kernel_data=*/reinterpret_cast<const void*>(0x12345678),
+              /*kernel_size=*/0, /*format=*/SourceFormat::kFunctionPtr,
               /*launch_dims=*/dims, /*shared_mem_bytes=*/0,
               /*uses_pdl=*/false, /*args=*/std::initializer_list<KernelArg>{});
           EXPECT_THAT(launch_cmd, IsOkAndHolds(Eq(state.launch_cmd)));
@@ -213,7 +214,7 @@ TEST(FfiTest, CreateLaunchWithFunctionPtr) {
     const XLA_FFI_Command* launch_cmd;
     const void* kernel_data = nullptr;
     int64_t kernel_size = -1;
-    XLA_FFI_SourceFormat format = XLA_FFI_SourceFormat_PTX;
+    XLA_FFI_SourceFormat format = static_cast<XLA_FFI_SourceFormat>(-1);
   } state{expected_cmd};
 
   const void* expected_func_ptr = reinterpret_cast<const void*>(0x12345678);
