@@ -123,6 +123,22 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "IllegalAccess", "CUDA",
                          kIllegalAccess);
 
 TEST_P(PjRtGpuClientStreamErrorTest, AbortsOnStreamError) {
+  // Warm up the pinned host memory pool with a device-to-host transfer.
+  // Otherwise, the pinned host allocation for the staging buffer of the
+  // device-to-host transfer below may be the first CUDA call after the faulting
+  // kernel, fail with the sticky error from the poisoned CUDA context and be
+  // reported as RESOURCE_EXHAUSTED instead of the stream error.
+  static constexpr absl::string_view kWarmUpProgram = R"(
+    HloModule warm_up
+    ENTRY main {
+      ROOT %c = f32[4] constant({1, 2, 3, 4})
+    })";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtLoadedExecutable> warm_up,
+                       CompileExecutable(kWarmUpProgram, *client_));
+  ASSERT_OK_AND_ASSIGN(auto warm_up_results,
+                       warm_up->Execute(/*argument_handles=*/{{}}, {}));
+  ASSERT_OK(warm_up_results[0][0]->ToLiteral().Await().status());
+
   static constexpr absl::string_view kIllegalProgram = R"(
     HloModule illegal_access
     ENTRY main {
