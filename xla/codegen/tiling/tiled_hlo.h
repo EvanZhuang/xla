@@ -136,9 +136,6 @@ class TiledHloInstruction {
     sink.Append(tiled_hlo.ToString());
   }
 
-  // Temporary helpers to match API of the old TiledHloInstruction.
-  // TODO: b/509505290 -- Remove these once we migrate to this tiling and the
-  // old API is removed.
   llvm::SmallVector<int64_t> tile_sizes() const {
     auto tile_sizes = tile().GetStaticTileSizes();
     CHECK_OK(tile_sizes);
@@ -253,9 +250,6 @@ class TiledHloComputation {
     sink.Append(tiled_computation.ToString());
   }
 
-  // Temporary helpers to match API of the old TiledHloComputation.
-  // TODO: b/509505290 -- Remove these once we migrate to this tiling and the
-  // old API is removed.
   int64_t num_output_tiles() const {
     int64_t res = 1;
     for (const auto& dimension : tiling_space_->dimensions()) {

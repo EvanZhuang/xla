@@ -329,13 +329,7 @@ absl::StatusOr<Value> EmitSingleTileDot(mlir::ImplicitLocOpBuilder& b,
                                         dot_operands.accumulator,
                                         precision_spec, dot_dimension_numbers);
 
-  // TODO(b/393299275): once we've moved on from the legacy emitter, we should
-  // make sure that this accumulator type is equal to the one derived here.
-  Type outer_accumulator_type = ElementType(dot_operands.accumulator);
-  if (ElementType(result) != outer_accumulator_type) {
-    result = Cast(b, result, outer_accumulator_type);
-  }
-
+  DCHECK_EQ(ElementType(result), ElementType(dot_operands.accumulator));
   return result;
 }
 

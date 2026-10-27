@@ -19,6 +19,8 @@ limitations under the License.
 #include <cstdint>
 #include <utility>
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/hash/hash.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
@@ -27,6 +29,7 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
+#include "xla/codegen/tiling/tile.h"
 #include "xla/codegen/tiling/tiled_hlo.h"
 #include "xla/codegen/tiling/tiling_space.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -49,6 +52,16 @@ constexpr int64_t kMaxTensorNumElements = 1048576;
 // larger than this as that leads to a large number of registers being used.
 // Also for MMA instruction we don't want tiles greater than 256.
 constexpr int64_t kMaxMMADimSize = 256;
+
+struct TilePtrHash {
+  size_t operator()(const Tile* tile) const { return absl::HashOf(*tile); }
+};
+
+struct TilePtrEqual {
+  bool operator()(const Tile* lhs, const Tile* rhs) const {
+    return lhs == rhs || *lhs == *rhs;
+  }
+};
 
 // Returns a conservative estimate (in bytes) of the memory required to stage a
 // tile whose sizes are `tile_sizes` for an instruction whose element type
@@ -93,7 +106,11 @@ Decision VerifyTritonConstraints(const TiledHloComputation& tiled_computation,
   // Triton's validate_block_shape (triton/python/triton/_utils.py) enforces
   // that the total number of elements in a padded block (product of tile sizes
   // padded to power of 2) does not exceed TRITON_MAX_TENSOR_NUMEL = 1048576.
+  absl::flat_hash_set<const Tile*, TilePtrHash, TilePtrEqual> visited_tiles;
   for (const TiledHloInstruction* inst : all_instructions) {
+    if (!visited_tiles.insert(&inst->tile()).second) {
+      continue;
+    }
     auto static_tile_sizes_or = inst->tile().GetStaticTileSizes();
     if (!static_tile_sizes_or.ok()) {
       return Decision(static_tile_sizes_or.status());
@@ -124,7 +141,8 @@ Decision VerifyTritonConstraints(const TiledHloComputation& tiled_computation,
   // TODO(b/393299275): There is also a lower bound limit for Triton on what
   // is accepted for dimension size (both contracting and free).
   for (const TiledHloInstruction* inst : all_instructions) {
-    if (inst->hlo()->opcode() == HloOpcode::kDot) {
+    if (inst->hlo()->opcode() == HloOpcode::kDot ||
+        inst->hlo()->opcode() == HloOpcode::kScaledDot) {
       for (const TiledHloInstruction* operand : inst->operands()) {
         auto op_tile_sizes_or = operand->tile().GetStaticTileSizes();
         if (!op_tile_sizes_or.ok()) {
