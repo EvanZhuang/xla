@@ -1244,11 +1244,48 @@ mlir::SmallVector<mlir::Value> maybeUnpadScanOutputs(
   return results;
 }
 
+// Returns true if `scan` has an unsharded non-scan (`kPassThrough`) dimension
+// whose size is divisible by `ctx.numPartitions`. When `needsScanPadding` is
+// true, we only fall back to `resolve-permutation-factors` when such a
+// dimension exists (matching GSPMD's `GetFirstTargetDimToMoveShardingTiles`
+// eligibility check in `SpmdPartitioningVisitor::HandleScan`), and keep the
+// 3-phase padded scan lowering when no non-scan dimension can evenly absorb
+// the sharding.
+bool hasDivisibleUnshardedNonScanDim(const ScanLoweringContext& ctx) {
+  auto in0Type =
+      llvm::cast<mlir::RankedTensorType>(ctx.scanInputs[0].getType());
+  int64_t rank = in0Type.getRank();
+  mlir::Attribute meshOrRef = ctx.inShardings[0].getMeshOrRef();
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == ctx.scanDim || in0Type.isDynamicDim(d) ||
+        in0Type.getDimSize(d) <= 0 ||
+        in0Type.getDimSize(d) % ctx.numPartitions != 0) {
+      continue;
+    }
+    int64_t carryDim = d < ctx.scanDim ? d : d - 1;
+    if (llvm::all_of(llvm::seq<int64_t>(0, ctx.numInputs), [&](int64_t i) {
+          mlir::sdy::TensorShardingAttr initSharding =
+              mlir::sdy::getOrCreateSharding(ctx.scanInits[i], meshOrRef,
+                                             /*closedIfMissing=*/true);
+          return ctx.inShardings[i].getDimSharding(d).getAxes().empty() &&
+                 ctx.outShardings[i].getDimSharding(d).getAxes().empty() &&
+                 initSharding.getDimSharding(carryDim).getAxes().empty() &&
+                 ctx.carryShardings[i]
+                     .getDimSharding(carryDim)
+                     .getAxes()
+                     .empty();
+        })) {
+      return true;
+    }
+  }
+  return false;
+}
+
 struct ScanPartitioningOpInterface
     : public mlir::sdy::PartitioningOpInterface::ExternalModel<
           ScanPartitioningOpInterface, mhlo::ScanOp> {
   std::optional<mlir::LogicalResult> resolvePermutationFactors(
-      mlir::Operation* op, mlir::sdy::OpShardingRuleAttr shardingRule,
+      mlir::Operation* op, mlir::sdy::OpShardingRuleAttr /*shardingRule*/,
       mlir::IRRewriter& rewriter, const mlir::SymbolTable& symbolTable) const {
     rewriter.setInsertionPoint(op);
     auto scan = llvm::cast<mhlo::ScanOp>(op);
@@ -1257,7 +1294,8 @@ struct ScanPartitioningOpInterface
     }
     std::optional<ScanLoweringContext> scanContext =
         createScanLoweringContext(scan, symbolTable);
-    if (!scanContext) {
+    if (!scanContext || (scanContext->needsScanPadding &&
+                         hasDivisibleUnshardedNonScanDim(*scanContext))) {
       // Fall back to default replication behavior if not eligible for lowering.
       return std::nullopt;
     }
