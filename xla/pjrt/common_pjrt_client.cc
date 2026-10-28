@@ -66,7 +66,13 @@ limitations under the License.
 #include "xla/error/error_codes.h"
 #include "xla/executable_run_options.h"
 #include "xla/future.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
+#include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
@@ -983,6 +989,344 @@ CommonPjRtClient::MakeLoadStateAndResolveAddressableDevices(
   return raw_client()->MakeLoadState();
 }
 
+namespace {
+
+// `PadRealToStatic` reads its bounded-dynamic operand as a compact buffer
+// without the dynamic-shape metadata prefix. The helpers below find the entry
+// parameters backing such operands and check that nothing else reads them:
+// every other consumer of a dynamic parameter expects the metadata prefix, so a
+// shared parameter cannot be passed correctly to both.
+
+// An array value under tracing: an instruction and the tuple index of the
+// array within it (empty for array-shaped instructions).
+struct TracedValue {
+  const HloInstruction* instruction;
+  ShapeIndex index;
+
+  bool operator==(const TracedValue& other) const {
+    return instruction == other.instruction && index == other.index;
+  }
+  template <typename H>
+  friend H AbslHashValue(H h, const TracedValue& value) {
+    return H::combine(std::move(h), value.instruction, value.index);
+  }
+};
+
+// One operand slot of an async chain: the async instruction and the operand
+// number within it.
+struct AsyncOperandSlot {
+  const HloInstruction* instruction;
+  int64_t operand_no;
+};
+
+// Returns the operand slots of the async chain starting at `start`, in the
+// order in which they are bound to the wrapped computation's parameters: the
+// `async-start` operands first, then operands 1.. of each `async-update` in
+// chain order (operand 0 of an update is the chain itself). This is the form
+// the TPU SparseCore offloader emits: an operand-less `async-start` followed
+// by one `async-update` carrying all the operands.
+std::vector<AsyncOperandSlot> AsyncChainOperandSlots(
+    const HloInstruction* start) {
+  std::vector<AsyncOperandSlot> slots;
+  for (int64_t i = 0; i < start->operand_count(); ++i) {
+    slots.push_back({start, i});
+  }
+  const auto* async = DynCast<HloAsyncInstruction>(start);
+  for (const HloAsyncInstruction* op =
+           async == nullptr ? nullptr : async->async_chain_next();
+       op != nullptr && op->opcode() == HloOpcode::kAsyncUpdate;
+       op = op->async_chain_next()) {
+    for (int64_t i = 1; i < op->operand_count(); ++i) {
+      slots.push_back({op, i});
+    }
+  }
+  return slots;
+}
+
+// Returns the parameter of the computation called by `caller` that
+// `caller->operand(operand_no)` is bound to, or nullptr if `caller` does not
+// bind operands to called-computation parameters by position. `kCall`,
+// `kFusion`, `kCustomCall` (with called computations) and `kAsyncStart` bind
+// operand i to parameter i; an `kAsyncUpdate` operand is bound according to
+// `AsyncChainOperandSlots`.
+const HloInstruction* CalledParameterForOperand(const HloInstruction* caller,
+                                                int64_t operand_no) {
+  const HloComputation* callee = nullptr;
+  int64_t param_no = -1;
+  switch (caller->opcode()) {
+    case HloOpcode::kCall:
+    case HloOpcode::kFusion:
+    case HloOpcode::kCustomCall:
+    case HloOpcode::kAsyncStart:
+      if (caller->called_computations().empty()) {
+        return nullptr;
+      }
+      callee = caller->called_computations().front();
+      param_no = operand_no;
+      break;
+    case HloOpcode::kAsyncUpdate: {
+      const HloInstruction* start = caller->async_chain_start();
+      callee = caller->async_wrapped_computation();
+      if (start == nullptr || callee == nullptr) {
+        return nullptr;
+      }
+      const std::vector<AsyncOperandSlot> slots = AsyncChainOperandSlots(start);
+      for (int64_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].instruction == caller &&
+            slots[i].operand_no == operand_no) {
+          param_no = i;
+          break;
+        }
+      }
+      break;
+    }
+    default:
+      return nullptr;
+  }
+  if (param_no < 0 || param_no >= callee->num_parameters()) {
+    return nullptr;
+  }
+  return callee->parameter_instruction(param_no);
+}
+
+// Returns the operands that the call sites of `parameter`'s computation bind to
+// `parameter` (the inverse of `CalledParameterForOperand`).
+std::vector<const HloInstruction*> OperandsBoundToParameter(
+    const HloInstruction* parameter,
+    absl::Span<const HloInstruction* const> call_sites) {
+  std::vector<const HloInstruction*> operands;
+  const int64_t param_no = parameter->parameter_number();
+  for (const HloInstruction* caller : call_sites) {
+    switch (caller->opcode()) {
+      case HloOpcode::kCall:
+      case HloOpcode::kFusion:
+      case HloOpcode::kCustomCall:
+        if (param_no < caller->operand_count()) {
+          operands.push_back(caller->operand(param_no));
+        }
+        break;
+      case HloOpcode::kAsyncStart: {
+        const std::vector<AsyncOperandSlot> slots =
+            AsyncChainOperandSlots(caller);
+        if (param_no < slots.size()) {
+          operands.push_back(
+              slots[param_no].instruction->operand(slots[param_no].operand_no));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return operands;
+}
+
+// Checks that the array `leaf` of entry parameter `parameter` is only read by
+// `PadRealToStatic` custom calls (as operand 0), possibly through copies,
+// bitcasts, tuple packing / unpacking and positional calls into
+// subcomputations. Returns an error naming the other user otherwise.
+absl::Status VerifyOnlyPadRealToStaticReadsLeaf(const HloInstruction* parameter,
+                                                const TracedValue& leaf) {
+  auto other_user_error = [&](const HloInstruction* value,
+                              const HloInstruction* user) {
+    return InvalidArgument(
+        "Entry parameter %d%s of %s feeds PadRealToStatic and is also %s "
+        "(through %s). A dynamic parameter consumed by PadRealToStatic is "
+        "passed as a compact buffer without dynamic-shape metadata, which no "
+        "other instruction can read, so it must have no other users.",
+        parameter->parameter_number(),
+        leaf.index.empty() ? "" : absl::StrCat(" ", leaf.index.ToString()),
+        parameter->GetModule()->name(),
+        user == value ? absl::StrCat("returned as a result of computation ",
+                                     value->parent()->name())
+                      : absl::StrCat("used by ", user->ToString()),
+        value->name());
+  };
+
+  std::vector<TracedValue> worklist = {leaf};
+  absl::flat_hash_set<TracedValue> visited;
+  while (!worklist.empty()) {
+    const TracedValue value = std::move(worklist.back());
+    worklist.pop_back();
+    if (!visited.insert(value).second) {
+      continue;
+    }
+    const HloInstruction* inst = value.instruction;
+    if (inst == inst->parent()->root_instruction()) {
+      // The buffer escapes as a (sub)computation result.
+      return other_user_error(inst, inst);
+    }
+    for (const HloInstruction* user : inst->users()) {
+      switch (user->opcode()) {
+        case HloOpcode::kGetTupleElement:
+          if (value.index.empty()) {
+            return other_user_error(inst, user);
+          }
+          if (user->tuple_index() == value.index.front()) {
+            worklist.push_back(
+                {user, ShapeIndex(value.index.begin() + 1, value.index.end())});
+          }
+          break;
+        case HloOpcode::kTuple:
+          for (int64_t i = 0; i < user->operand_count(); ++i) {
+            if (user->operand(i) == inst) {
+              ShapeIndex index = value.index;
+              index.push_front(i);
+              worklist.push_back({user, std::move(index)});
+            }
+          }
+          break;
+        case HloOpcode::kCopy:
+        case HloOpcode::kBitcast:
+          worklist.push_back({user, value.index});
+          break;
+        case HloOpcode::kCustomCall:
+          if (user->IsCustomCall("PadRealToStatic")) {
+            if (!value.index.empty() || user->operand(0) != inst ||
+                absl::c_count(user->operands(), inst) != 1) {
+              return other_user_error(inst, user);
+            }
+            break;
+          }
+          [[fallthrough]];
+        case HloOpcode::kCall:
+        case HloOpcode::kFusion:
+        case HloOpcode::kAsyncStart:
+        case HloOpcode::kAsyncUpdate:
+          for (int64_t i = 0; i < user->operand_count(); ++i) {
+            if (user->operand(i) != inst) {
+              continue;
+            }
+            const HloInstruction* param = CalledParameterForOperand(user, i);
+            if (param == nullptr) {
+              return other_user_error(inst, user);
+            }
+            worklist.push_back({param, value.index});
+          }
+          break;
+        default:
+          return other_user_error(inst, user);
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::Status ClearPadRealToStaticParameterMetadataPrefixes(
+    const HloModule& hlo_module, absl::Span<Shape> parameter_shapes) {
+  const HloComputation* entry_comp = hlo_module.entry_computation();
+  if (entry_comp == nullptr) {
+    return absl::OkStatus();
+  }
+
+  // Call sites of every computation, and the operands of all `PadRealToStatic`
+  // custom calls (in any computation, e.g. one offloaded to SparseCore).
+  absl::flat_hash_map<const HloComputation*, std::vector<const HloInstruction*>>
+      call_sites;
+  std::vector<TracedValue> worklist;
+  for (const HloComputation* comp : hlo_module.computations()) {
+    for (const HloInstruction* instruction : comp->instructions()) {
+      for (const HloComputation* called : instruction->called_computations()) {
+        call_sites[called].push_back(instruction);
+      }
+      if (instruction->IsCustomCall("PadRealToStatic") &&
+          instruction->operand_count() > 0) {
+        worklist.push_back({instruction->operand(0), ShapeIndex()});
+      }
+    }
+  }
+  if (worklist.empty()) {
+    return absl::OkStatus();
+  }
+
+  // Trace each operand back to the entry parameter array it is a view of. The
+  // index is relative to the current instruction; `PadRealToStatic` operands
+  // are arrays, so the trace starts with an empty index.
+  std::vector<TracedValue> leaves;
+  absl::flat_hash_set<TracedValue> visited;
+  while (!worklist.empty()) {
+    TracedValue value = std::move(worklist.back());
+    worklist.pop_back();
+    if (!visited.insert(value).second) {
+      continue;
+    }
+    const HloInstruction* inst = value.instruction;
+    switch (inst->opcode()) {
+      case HloOpcode::kCopy:
+      case HloOpcode::kBitcast:
+        worklist.push_back({inst->operand(0), std::move(value.index)});
+        break;
+      case HloOpcode::kGetTupleElement:
+        value.index.push_front(inst->tuple_index());
+        worklist.push_back({inst->operand(0), std::move(value.index)});
+        break;
+      case HloOpcode::kTuple:
+        if (!value.index.empty()) {
+          const int64_t element = value.index.front();
+          worklist.push_back(
+              {inst->operand(element),
+               ShapeIndex(value.index.begin() + 1, value.index.end())});
+        }
+        break;
+      case HloOpcode::kParameter:
+        if (inst->parent() == entry_comp) {
+          leaves.push_back(std::move(value));
+        } else if (auto it = call_sites.find(inst->parent());
+                   it != call_sites.end()) {
+          for (const HloInstruction* operand :
+               OperandsBoundToParameter(inst, it->second)) {
+            worklist.push_back({operand, value.index});
+          }
+        }
+        break;
+      default:
+        // Not a view of an entry parameter; the TPU compiler rejects such
+        // `PadRealToStatic` operands.
+        break;
+    }
+  }
+
+  // `GetParameterShapes` flattens a single tuple entry parameter into one shape
+  // per top-level tuple element.
+  const auto& layout = hlo_module.entry_computation_layout();
+  const bool flattened_tuple_parameter =
+      layout.parameter_count() == 1 && layout.parameter_shape(0).IsTuple();
+  for (const TracedValue& leaf : leaves) {
+    const HloInstruction* parameter = leaf.instruction;
+    if (!ShapeUtil::IndexIsValid(parameter->shape(), leaf.index)) {
+      continue;
+    }
+    const Shape& leaf_shape =
+        ShapeUtil::GetSubshape(parameter->shape(), leaf.index);
+    if (!leaf_shape.IsArray() || !leaf_shape.is_dynamic()) {
+      continue;
+    }
+    ABSL_RETURN_IF_ERROR(VerifyOnlyPadRealToStaticReadsLeaf(parameter, leaf));
+
+    int64_t shape_no = parameter->parameter_number();
+    ShapeIndex index = leaf.index;
+    if (flattened_tuple_parameter) {
+      if (shape_no != 0 || index.empty()) {
+        continue;
+      }
+      shape_no = index.front();
+      index = ShapeIndex(index.begin() + 1, index.end());
+    }
+    if (shape_no < 0 || shape_no >= parameter_shapes.size() ||
+        !ShapeUtil::IndexIsValid(parameter_shapes[shape_no], index)) {
+      continue;
+    }
+    Shape* subshape =
+        ShapeUtil::GetMutableSubshape(&parameter_shapes[shape_no], index);
+    if (subshape->IsArray() && subshape->has_layout()) {
+      subshape->mutable_layout()->set_dynamic_shape_metadata_prefix_bytes(0);
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
 CommonPjRtClient::LoadInternal(std::shared_ptr<PjRtExecutable> executable,
                                const LoadOptions& load_options, bool dump) {
@@ -1122,27 +1466,8 @@ CommonPjRtClient::LoadInternal(
     // shapes. However, custom call PadRealToStatic consumes dynamic inputs
     // without the 1024-byte metadata prefix. Find parameters feeding
     // PadRealToStatic custom calls and explicitly set their prefix bytes to 0.
-    const HloComputation* entry_comp = hlo_module->entry_computation();
-    for (const HloInstruction* instruction : entry_comp->instructions()) {
-      if (instruction->IsCustomCall("PadRealToStatic") &&
-          instruction->operand_count() > 0) {
-        const HloInstruction* operand = instruction->operand(0);
-        while (operand->opcode() == HloOpcode::kCopy ||
-               operand->opcode() == HloOpcode::kBitcast) {
-          operand = operand->operand(0);
-        }
-        CHECK(operand->opcode() == HloOpcode::kParameter);
-        CHECK(operand->shape().IsArray());
-        int64_t param_no = operand->parameter_number();
-        DCHECK_LT(param_no, parameter_shapes.size());
-        DCHECK(parameter_shapes[param_no].IsArray());
-        if (param_no < parameter_shapes.size()) {
-          parameter_shapes[param_no]
-              .mutable_layout()
-              ->set_dynamic_shape_metadata_prefix_bytes(0);
-        }
-      }
-    }
+    ABSL_RETURN_IF_ERROR(ClearPadRealToStaticParameterMetadataPrefixes(
+        *hlo_module, absl::MakeSpan(parameter_shapes)));
   }
   using InputHloSnapshotBits =
       CommonPjRtLoadedExecutable::DispatchInfo::InputHloSnapshotBits;

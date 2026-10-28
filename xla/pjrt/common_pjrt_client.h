@@ -77,6 +77,21 @@ TransferIncarnations(
     int src_process_index, int dst_process_index,
     const absl::flat_hash_map<TaskId, IncarnationId>& incarnations);
 
+class HloModule;
+
+// Clears `dynamic_shape_metadata_prefix_bytes` on the canonicalized TPU entry
+// `parameter_shapes` (as produced by
+// `GetParameterShapes(hlo_module.entry_computation_layout())`) of the dynamic
+// entry parameter arrays that feed a `PadRealToStatic` custom call, which reads
+// its operand as a compact buffer without the metadata prefix. Parameters are
+// traced through copies, bitcasts, tuple packing / unpacking and positional
+// calls into subcomputations (`kCall`, `kFusion`, `kCustomCall` with called
+// computations, SparseCore `kAsyncStart` / `kAsyncUpdate` offloads). Returns an
+// error if such a parameter also has any other user, since no other
+// instruction can read a buffer without the metadata prefix.
+absl::Status ClearPadRealToStaticParameterMetadataPrefixes(
+    const HloModule& hlo_module, absl::Span<Shape> parameter_shapes);
+
 // A common base class for Pjrt clients based on raw buffers.
 class CommonPjRtClient : public PjRtClient {
  public:

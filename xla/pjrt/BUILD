@@ -275,11 +275,16 @@ xla_cc_test(
     srcs = ["common_pjrt_client_test.cc"],
     deps = [
         ":common_pjrt_client",
+        ":infer_dispatch_info",
         ":pjrt_client",
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
         "//xla/runtime:device_id",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],
 )
