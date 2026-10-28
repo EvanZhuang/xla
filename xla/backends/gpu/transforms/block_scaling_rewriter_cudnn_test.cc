@@ -298,5 +298,51 @@ ENTRY main {
                             "CHECK: __cudnn$blockScaledDot");
 }
 
+class CudnnScaledDotRewriterCudnnTest : public BlockScalingRewriterCudnnTest {
+ protected:
+  // Runs CudnnScaledDotRewriter on `hlo` (with layouts already assigned) and
+  // compares the result against the interpreter.
+  void RunAndCompareRewriter(absl::string_view hlo) {
+    EXPECT_TRUE(RunAndCompareNoHloPasses(
+        hlo, ErrorSpec(/*aabs=*/1e-4, /*arel=*/1e-5),
+        /*reference_preprocessor=*/nullptr,
+        /*test_preprocessor=*/[](HloModule* test_module) {
+          CudnnScaledDotRewriter pass;
+          EXPECT_THAT(RunHloPass(&pass, test_module),
+                      absl_testing::IsOkAndHolds(true));
+        }));
+  }
+};
+
+TEST_F(CudnnScaledDotRewriterCudnnTest, PaddedScales3dNN) {
+  RunAndCompareRewriter(R"(
+HloModule test
+
+ENTRY main {
+  %lhs = f8e4m3fn[4,250,224]{2,1,0} parameter(0)
+  %rhs = f8e5m2[4,224,120]{1,2,0} parameter(1)
+  %lhs_scale = f8e8m0fnu[4,250,7]{2,1,0} parameter(2)
+  %rhs_scale = f8e8m0fnu[4,7,120]{1,2,0} parameter(3)
+  ROOT %result = f32[4,250,120]{2,1,0} scaled-dot(%lhs, %rhs, %lhs_scale, %rhs_scale),
+      lhs_batch_dims={0}, rhs_batch_dims={0},
+      lhs_contracting_dims={2}, rhs_contracting_dims={1}
+})");
+}
+
+TEST_F(CudnnScaledDotRewriterCudnnTest,
+       PaddedContractingAndNonContracting2dTN) {
+  RunAndCompareRewriter(R"(
+HloModule test
+
+ENTRY main {
+  %lhs = f8e4m3fn[64,128]{0,1} parameter(0)
+  %rhs = f8e4m3fn[64,200]{0,1} parameter(1)
+  %lhs_scale = f8e8m0fnu[2,128]{0,1} parameter(2)
+  %rhs_scale = f8e8m0fnu[2,200]{0,1} parameter(3)
+  ROOT %result = f32[128,200]{1,0} scaled-dot(%lhs, %rhs, %lhs_scale, %rhs_scale),
+      lhs_contracting_dims={0}, rhs_contracting_dims={0}
+})");
+}
+
 }  // namespace
 }  // namespace xla::gpu
