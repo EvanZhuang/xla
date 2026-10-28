@@ -48,6 +48,7 @@ limitations under the License.
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tsl/platform/numbers.h"
+#include "xla/hlo/analysis/hlo_alias_analysis.h"
 #include "xla/hlo/analysis/hlo_dataflow_analysis.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_clone_context.h"
@@ -64,6 +65,7 @@ limitations under the License.
 #include "xla/layout_util.h"
 #include "xla/map_util.h"
 #include "xla/service/call_graph.h"
+#include "xla/service/hlo_buffer.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_value.h"
 #include "xla/shape.h"
@@ -485,10 +487,13 @@ UsesList GetUsers(const HloRematInstructionList& instruction_list,
 // at the current point in the instruction sequence.
 class MemoryUsageTracker {
  public:
-  MemoryUsageTracker(const HloRematerialization::Options& options,
-                     const HloComputation* computation,
-                     const HloDataflowAnalysis& dataflow_analysis,
-                     const HloRematInstructionList& instruction_list);
+  // `value_overwriters` may be null.
+  MemoryUsageTracker(
+      const HloRematerialization::Options& options,
+      const HloComputation* computation,
+      const HloDataflowAnalysis& dataflow_analysis,
+      const HloRematInstructionList& instruction_list,
+      const absl::flat_hash_map<int64_t, int64_t>* value_overwriters = nullptr);
 
   // Starts the placement of the given instruction. This adds the sizes of the
   // HloValues defined by the instruction to the current memory
@@ -580,6 +585,28 @@ class MemoryUsageTracker {
 
   // Returns the list of uses for a specific 'item'.
   UsesList GetItemUses(HloRematItem* item) const;
+
+  // An operand whose buffer 'writer' overwrites later.
+  struct OperandOverwrite {
+    int64_t operand_number;
+    BufferId buffer_id;
+    HloRematItem* writer;
+  };
+
+  // Returns the operands of 'item' whose writer is placed, or unplaced.
+  absl::InlinedVector<OperandOverwrite, 1> Overwrites(const HloRematItem* item,
+                                                      bool placed) const;
+
+  // Makes 'remat_item' read 'copy_item', a placed copy of 'buffer_id' made
+  // before the overwrite, instead of the buffer.
+  absl::Status AddSavedCopy(HloRematItem* remat_item, BufferId buffer_id,
+                            HloRematItem* copy_item);
+
+  // Returns whether 'item' overwrites a buffer or defines an overwritten one.
+  // Such items must not move, so they are not rematerialized.
+  bool IsPinnedByOverwrite(const HloRematItem* item) const {
+    return pinned_items_.contains(item);
+  }
 
   // Returns whether 'item' is currently in progress.
   bool IsInProgressItem(HloRematItem* item) const {
@@ -814,13 +841,32 @@ class MemoryUsageTracker {
 
   // All buffers in the computation.
   std::vector<Buffer> buffers_;
+
+  absl::flat_hash_map<const HloRematItem*,
+                      absl::InlinedVector<OperandOverwrite, 1>>
+      operand_overwrites_;
+
+  // See IsPinnedByOverwrite.
+  absl::flat_hash_set<const HloRematItem*> pinned_items_;
+
+  // Size of a copy of 'buffer_id'. Nonzero even for parameters.
+  int64_t SavedCopySize(BufferId buffer_id) const {
+    const Buffer& buffer = buffers_.at(buffer_id);
+    if (options_.host_memory_offload_config && buffer.shape.has_layout() &&
+        buffer.shape.layout().memory_space() ==
+            options_.host_memory_offload_config->host_memory_space) {
+      return 0;
+    }
+    return buffer.size;
+  }
 };
 
 MemoryUsageTracker::MemoryUsageTracker(
     const HloRematerialization::Options& options,
     const HloComputation* computation,
     const HloDataflowAnalysis& dataflow_analysis,
-    const HloRematInstructionList& instruction_list)
+    const HloRematInstructionList& instruction_list,
+    const absl::flat_hash_map<int64_t, int64_t>* value_overwriters)
     : options_(options),
       computation_(computation),
       instruction_list_(instruction_list) {
@@ -890,6 +936,58 @@ MemoryUsageTracker::MemoryUsageTracker(
         dataflow_analysis.GetFlattenedValueSet(instruction);
     for (const HloValue* value : flattened_values.values()) {
       item->buffers_output.push_back(value_to_buffer_id.at(value));
+    }
+  }
+
+  // Record operands whose buffer is overwritten later.
+  if (value_overwriters != nullptr) {
+    absl::flat_hash_map<int64_t, HloRematItem*> item_by_unique_id;
+    item_by_unique_id.reserve(instruction_list_.size());
+    for (auto* item = instruction_list_.first(); item != nullptr;
+         item = instruction_list_.next(item)) {
+      item_by_unique_id[item->instruction->unique_id()] = item;
+    }
+    for (auto* item = instruction_list_.first(); item != nullptr;
+         item = instruction_list_.next(item)) {
+      const HloInstruction* instruction = item->instruction;
+      for (int64_t operand_number = 0;
+           operand_number < instruction->operand_count(); ++operand_number) {
+        const HloInstruction* operand = instruction->operand(operand_number);
+        if (!operand->shape().IsArray()) {
+          continue;
+        }
+        auto overwriter = value_overwriters->find(operand->unique_id());
+        if (overwriter == value_overwriters->end()) {
+          continue;
+        }
+        auto writer = item_by_unique_id.find(overwriter->second);
+        const HloValueSet& value_set = dataflow_analysis.GetValueSet(operand);
+        if (writer == item_by_unique_id.end() ||
+            value_set.values().size() != 1) {
+          continue;
+        }
+        // Writers must not move. This includes in place updates of 'item's
+        // own operand, which a recomputation would apply twice.
+        pinned_items_.insert(writer->second);
+        if (writer->second == item) {
+          continue;
+        }
+        auto buffer_id = value_to_buffer_id.find(&value_set.GetUniqueValue());
+        // Skip operands that don't read the buffer, e.g. unused fusion
+        // parameters.
+        if (buffer_id == value_to_buffer_id.end() ||
+            !absl::c_any_of(buffers_.at(buffer_id->second).users,
+                            [&](const HloRematItemUse& use) {
+                              return use.user == item &&
+                                     use.operand_number == operand_number;
+                            })) {
+          continue;
+        }
+        operand_overwrites_[item].push_back(
+            {operand_number, buffer_id->second, writer->second});
+        pinned_items_.insert(
+            buffers_.at(buffer_id->second).defining_instruction);
+      }
     }
   }
   XLA_VLOG_LINES(10, ToString());
@@ -1014,6 +1112,27 @@ bool MemoryUsageTracker::ExtendRecomputeBlock(const HloRematItem* item,
     return false;
   }
 
+  // An already overwritten operand is read from a copy saved before the
+  // overwrite. Each item pays for its own copy.
+  absl::InlinedVector<BufferId, 2> saved_buffers;
+  for (const OperandOverwrite& overwrite : Overwrites(item, /*placed=*/true)) {
+    if (absl::c_linear_search(saved_buffers, overwrite.buffer_id)) {
+      continue;
+    }
+    // One copy can't replace other views of the buffer, e.g. a bitcast.
+    const HloInstruction* operand =
+        candidate->operand(overwrite.operand_number);
+    for (const HloRematItemUse& use : buffers_.at(overwrite.buffer_id).users) {
+      if (use.user == item &&
+          candidate->operand(use.operand_number) != operand) {
+        return false;
+      }
+    }
+    saved_buffers.push_back(overwrite.buffer_id);
+    state->memory_reduced -= SavedCopySize(overwrite.buffer_id);
+    state->zero_cost_move = false;
+  }
+
   for (BufferId buffer_id : item->buffers_defined) {
     const Buffer& buffer = buffers_.at(buffer_id);
     // Avoid rematerializing instructions with indirect uses as it is
@@ -1032,7 +1151,8 @@ bool MemoryUsageTracker::ExtendRecomputeBlock(const HloRematItem* item,
   }
 
   for (BufferId buffer_id : item->buffers_used) {
-    if (!IsCurrentlyLive(buffer_id)) {
+    if (!IsCurrentlyLive(buffer_id) &&
+        !absl::c_linear_search(saved_buffers, buffer_id)) {
       HloRematItem* defining_instruction =
           buffers_.at(buffer_id).defining_instruction;
       if (!absl::c_linear_search(state->items, defining_instruction) &&
@@ -1162,6 +1282,12 @@ absl::Status MemoryUsageTracker::AddRematerializedInstruction(
 
   // Construct the list of buffers used and defined by the rematerialization.
   remat_item->buffers_used = original_item->buffers_used;
+  if (auto it = operand_overwrites_.find(original_item);
+      it != operand_overwrites_.end()) {
+    // Copy first: inserting may rehash and invalidate 'it'.
+    auto overwrites = it->second;
+    operand_overwrites_[remat_item] = std::move(overwrites);
+  }
 
   // Account for the additional buffer uses created by the new rematerialization
   // instruction. Update memory usage if the rematerialization makes a dead
@@ -1840,7 +1966,10 @@ MemoryUsageTracker::PickRematerializationCandidates(
     // In peak priority mode, the map includes all instructions that were
     // recomputed so far to improve compilation time and remat efficiency. Such
     // optimization could be applied to other modes as well.
-    if (AnyDenylistedOrNonRematerializable(block, rematerializable_map)) {
+    if (AnyDenylistedOrNonRematerializable(block, rematerializable_map) ||
+        absl::c_any_of(block, [this](const HloRematItem* item) {
+          return IsPinnedByOverwrite(item);
+        })) {
       VLOG(5) << "Block contains denylisted or non-rematerializable items, "
                  "skipping.";
       continue;
@@ -1932,6 +2061,7 @@ MemoryUsageTracker::PickRematerializationCandidates(
       if (next_item == nullptr || next_item->denylisted || !next_item->placed ||
           next_item == in_progress_item_ ||
           !CanBeRematerialized(next_item->instruction, rematerializable_map) ||
+          IsPinnedByOverwrite(next_item) ||
           !ExtendRecomputeBlock(next_item, &block_state)) {
         break;
       }
@@ -1962,6 +2092,66 @@ UsesList MemoryUsageTracker::GetItemUses(HloRematItem* item) const {
     }
   }
   return combined_users;
+}
+
+absl::InlinedVector<MemoryUsageTracker::OperandOverwrite, 1>
+MemoryUsageTracker::Overwrites(const HloRematItem* item, bool placed) const {
+  absl::InlinedVector<OperandOverwrite, 1> overwrites;
+  if (auto it = operand_overwrites_.find(item);
+      it != operand_overwrites_.end()) {
+    absl::c_copy_if(it->second, std::back_inserter(overwrites),
+                    [&](const OperandOverwrite& overwrite) {
+                      return overwrite.writer->placed == placed;
+                    });
+  }
+  return overwrites;
+}
+
+absl::Status MemoryUsageTracker::AddSavedCopy(HloRematItem* remat_item,
+                                              BufferId buffer_id,
+                                              HloRematItem* copy_item) {
+  TF_RET_CHECK(copy_item->placed);
+  TF_RET_CHECK(!remat_item->placed);
+  auto& overwrites = operand_overwrites_[remat_item];
+  overwrites.erase(std::remove_if(overwrites.begin(), overwrites.end(),
+                                  [&](const OperandOverwrite& overwrite) {
+                                    return overwrite.buffer_id == buffer_id;
+                                  }),
+                   overwrites.end());
+
+  Buffer& buffer = buffers_.at(buffer_id);
+  UsesList copy_uses;
+  UsesList kept_uses;
+  for (const HloRematItemUse& use : buffer.users) {
+    if (use.user == remat_item) {
+      copy_uses.push_back(
+          HloRematItemUse{use.user, use.operand_number, std::nullopt});
+    } else {
+      kept_uses.push_back(use);
+    }
+  }
+  TF_RET_CHECK(!copy_uses.empty()) << buffer.ToString();
+  kept_uses.push_back(HloRematItemUse{copy_item, 0, std::nullopt});
+  buffer.users = std::move(kept_uses);
+  copy_item->buffers_used = {buffer_id};
+  remat_item->buffers_used.erase(
+      absl::c_find(remat_item->buffers_used, buffer_id));
+  if (--buffer.unfinished_user_count == 0) {
+    memory_usage_ -= AllocatedSize(buffer_id);
+  }
+
+  Buffer& copy_buffer =
+      NewBuffer(copy_item, copy_item->instruction->shape(), ShapeIndex{},
+                std::move(copy_uses), /*live_out=*/false,
+                /*has_indirect_uses=*/false);
+  copy_item->buffers_defined = {copy_buffer.id};
+  copy_item->buffers_output = {copy_buffer.id};
+  remat_item->buffers_used.push_back(copy_buffer.id);
+  memory_usage_ += SavedCopySize(buffer_id);
+
+  VLOG(3) << "  memory usage = " << memory_usage_;
+  DCHECK(Check());
+  return absl::OkStatus();
 }
 
 // Performs the rematerialization of all items in `best_items` and returns the
@@ -2077,6 +2267,34 @@ absl::StatusOr<int64_t> RematerializeInstructions(
     ABSL_RETURN_IF_ERROR(memory_tracker->AddRematerializedInstruction(
         best_item, remat_item, absl::MakeSpan(indirect_users)));
 
+    // Read already overwritten operands from a copy made before the overwrite.
+    absl::InlinedVector<BufferId, 2> saved_buffers;
+    for (const MemoryUsageTracker::OperandOverwrite& overwrite :
+         memory_tracker->Overwrites(remat_item, /*placed=*/true)) {
+      if (absl::c_linear_search(saved_buffers, overwrite.buffer_id)) {
+        continue;
+      }
+      saved_buffers.push_back(overwrite.buffer_id);
+      HloInstruction* operand =
+          remat->mutable_operand(overwrite.operand_number);
+      HloInstruction* copy = computation->AddInstruction(
+          HloInstruction::CreateUnary(operand->shape(), HloOpcode::kCopy,
+                                      operand),
+          /*new_name=*/absl::StrCat(operand->name(), ".remat_saved"));
+      copy->set_metadata(operand->metadata());
+      ABSL_RETURN_IF_ERROR(
+          copy->AddControlDependencyTo(overwrite.writer->instruction));
+      ABSL_RETURN_IF_ERROR(operand->ReplaceUseWith(remat, copy));
+      HloRematItem* copy_item = instruction_list->CreateItem(copy);
+      copy_item->placed = true;
+      instruction_list->InsertBeforeInstructions(copy_item, {overwrite.writer});
+      instruction_list->Denylist(copy);
+      (*rematerializable_map)[copy] = false;
+      ABSL_RETURN_IF_ERROR(memory_tracker->AddSavedCopy(
+          remat_item, overwrite.buffer_id, copy_item));
+      ++net_instructions_added;
+    }
+
     // Insert rematerialized instruction right before the earliest unplaced
     // use of the instruction *and* the earliest unplaced last use of any
     // operands of remat. Unplaced uses of the remat's operands are included
@@ -2132,6 +2350,13 @@ absl::StatusOr<int64_t> RematerializeInstructions(
           }
         }
       }
+    }
+    // Run before unplaced overwriters of an operand. The control edge also
+    // places it before them below.
+    for (const MemoryUsageTracker::OperandOverwrite& overwrite :
+         memory_tracker->Overwrites(remat_item, /*placed=*/false)) {
+      ABSL_RETURN_IF_ERROR(
+          remat->AddControlDependencyTo(overwrite.writer->instruction));
     }
     // Insert rematerialized instruction before any of its successors to
     // preserve ordering regarding control dependency.
@@ -2711,6 +2936,69 @@ void HloRematerialization::SetDataflowAnalysisStale() {
   dataflow_analysis_ = nullptr;
 }
 
+absl::Status HloRematerialization::ComputeValueOverwriters(
+    const HloModule* module) {
+  value_overwriters_.clear();
+  if (options_.alias_info == nullptr) {
+    return absl::OkStatus();
+  }
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<HloAliasAnalysis> alias_analysis,
+                        HloAliasAnalysis::Run(module, options_.alias_info));
+  absl::flat_hash_map<const HloInstruction*, int64_t> position;
+  for (const auto& [computation_id, sequence] :
+       module->schedule().sequences()) {
+    int64_t i = 0;
+    for (const HloInstruction* instruction : sequence.instructions()) {
+      position[instruction] = i++;
+    }
+  }
+  for (const HloBuffer& buffer : alias_analysis->buffers()) {
+    if (buffer.values().size() < 2) {
+      continue;
+    }
+    // Group the buffer's values by defining computation, in schedule order.
+    absl::flat_hash_map<const HloComputation*,
+                        std::vector<std::pair<int64_t, const HloValue*>>>
+        values_by_computation;
+    for (const HloValue* value : buffer.values()) {
+      const HloInstruction* definer = value->defining_instruction();
+      auto it = position.find(definer);
+      if (it == position.end()) {
+        continue;
+      }
+      values_by_computation[definer->parent()].push_back({it->second, value});
+    }
+    for (auto& [computation, values] : values_by_computation) {
+      absl::c_sort(values, [](const auto& a, const auto& b) {
+        return a.first < b.first;
+      });
+      // Each value is overwritten by the definer of the next value.
+      for (size_t i = 0; i < values.size(); ++i) {
+        size_t next = i + 1;
+        while (next < values.size() && values[next].first == values[i].first) {
+          ++next;
+        }
+        if (next == values.size()) {
+          break;
+        }
+        const int64_t writer_id =
+            values[next].second->defining_instruction()->unique_id();
+        for (const HloPosition& value_position :
+             values[i].second->positions()) {
+          if (value_position.instruction->parent() == computation &&
+              value_position.index.empty()) {
+            value_overwriters_[value_position.instruction->unique_id()] =
+                writer_id;
+          }
+        }
+      }
+    }
+  }
+  VLOG(2) << "Rematerialization respects " << value_overwriters_.size()
+          << " positions of overwritten values.";
+  return absl::OkStatus();
+}
+
 absl::StatusOr<bool>
 HloRematerialization::RematerializeCalledComputationsPeakPriority(
     const CallSite* callsite, int64_t memory_tracker_memory_usage,
@@ -2822,7 +3110,8 @@ HloRematerialization::PeakPrioritySubPass(
           << state.instruction_list->size();
   ABSL_RETURN_IF_ERROR(UpdateDataflowAnalysis(computation->parent()));
   MemoryUsageTracker memory_tracker(options_, computation, *dataflow_analysis_,
-                                    *state.instruction_list);
+                                    *state.instruction_list,
+                                    &value_overwriters_);
   state.instruction_list->PromoteNodesToSkip([&](HloRematItem* item) {
     return memory_tracker.AllocatedSize(item) >= min_remat_size;
   });
@@ -3117,7 +3406,7 @@ absl::StatusOr<bool> HloRematerialization::RematerializeComputation(
 
   HloRematInstructionList instruction_list(schedule->sequence(computation));
   MemoryUsageTracker memory_tracker(options_, computation, *dataflow_analysis_,
-                                    instruction_list);
+                                    instruction_list, &value_overwriters_);
 
   instruction_list.PromoteNodesToSkip([&](HloRematItem* item) {
     return memory_tracker.AllocatedSize(item) >= min_remat_size;
@@ -3369,6 +3658,7 @@ absl::StatusOr<bool> HloRematerialization::RunImpl(
 
   TF_RET_CHECK(module->has_schedule());
   ABSL_RETURN_IF_ERROR(UpdateDataflowAnalysis(module));
+  value_overwriters_.clear();
   next_channel_id_ = hlo_query::NextChannelId(*module);
 
   // Adjust memory limit to account for the output of the entry
@@ -3478,6 +3768,11 @@ absl::StatusOr<bool> HloRematerialization::RunImpl(
       before_entry_peak_memory + module_output_size + total_async_peak_memory;
   VLOG(1) << "Peak memory usage of module (before): "
           << HumanReadableNumBytes(before_peak_memory);
+
+  // Only needed if there is something to rematerialize.
+  if (before_entry_peak_memory > adjusted_memory_limit_bytes) {
+    ABSL_RETURN_IF_ERROR(ComputeValueOverwriters(module));
+  }
 
   // Initialize the HloCostAnalysis on this computation.
   for (auto* computation :
