@@ -40,12 +40,14 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/triton/xtile_compiler.h"
 #include "xla/backends/gpu/tests/gpu_pjrt_codegen_test.h"
 #include "xla/backends/gpu/transforms/convert_triton_gemm_config.h"
+#include "xla/backends/gpu/transforms/gemm_fusion.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/error_spec.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
@@ -871,6 +873,59 @@ ENTRY r {
 )");
 
   EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+}
+
+TEST_P(TritonGemmTest, BitcastIsNotHoistedAboveLayoutChangingCopy) {
+  if (!GetParam()) {
+    GTEST_SKIP() << "Bitcast hoisting is specific to GemmFusionV2.";
+  }
+  constexpr absl::string_view kHloText = R"(
+HloModule m
+
+ENTRY e {
+  p0 = f32[2,3]{0,1} parameter(0)
+  p1 = f32[2,2]{1,0} parameter(1)
+  copy = f32[2,3]{1,0} copy(p0)
+  bitcast = f32[3,2]{1,0} bitcast(copy)
+  ROOT dot = f32[3,2]{1,0} dot(bitcast, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+})";
+
+  // Run GemmFusion before other passes can simplify the copy/bitcast pair.
+  // The interpreter receives the original module, before this preprocessing.
+  EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3},
+                            /*reference_preprocessor=*/nullptr,
+                            /*test_preprocessor=*/[&](HloModule* module) {
+                              ASSERT_THAT(
+                                  GemmFusion(device_description()).Run(module),
+                                  absl_testing::IsOkAndHolds(true));
+                            }));
+}
+
+TEST_P(TritonGemmTest, BitcastDoesNotSinkPastLayoutChangingCopy) {
+  if (!GetParam()) {
+    GTEST_SKIP() << "Bitcast sinking is specific to GemmFusionV2.";
+  }
+  constexpr absl::string_view kHloText = R"(
+HloModule m
+
+ENTRY e {
+  p0 = f32[3,2]{1,0} parameter(0)
+  p1 = f32[2,2]{1,0} parameter(1)
+  dot = f32[3,2]{1,0} dot(p0, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  bitcast = f32[2,3]{1,0} bitcast(dot)
+  ROOT copy = f32[2,3]{0,1} copy(bitcast)
+})";
+
+  // Preserve the bitcast/copy pair until GemmFusion, as in the prologue test.
+  EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3},
+                            /*reference_preprocessor=*/nullptr,
+                            /*test_preprocessor=*/[&](HloModule* module) {
+                              ASSERT_THAT(
+                                  GemmFusion(device_description()).Run(module),
+                                  absl_testing::IsOkAndHolds(true));
+                            }));
 }
 
 // TODO(b/393299275): this is a pure test of fusion logic. It should be moved to
