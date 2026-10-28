@@ -61,7 +61,6 @@ using Command = CommandBuffer::Command;
 using KeySpace = CudaGraphAnnotationRegistry::KeySpace;
 using Scope = ScopedCommandBufferAnnotation;
 using TelemetryStrategy = CudaGraphAnnotationRegistry::TelemetryStrategy;
-using TrackMode = CudaGraphAnnotationRegistry::TrackMode;
 
 uint64_t ExecNodeId(uint32_t exec_id, uint32_t flat_local_id) {
   return (uint64_t{exec_id} << 32) | flat_local_id;
@@ -184,16 +183,14 @@ TEST_F(CudaCommandBufferTelemetryTest,
     // KeySpace::kTemplateGraph to verify RegisterPre134ExecGraphNodes does not
     // clobber template entries when `cuGraphExecGetId` collides with
     // `cuGraphGetId`. Skipped if one of this test's own graphs already has that
-    // ID: `kNewGraph` would retire its live entry.
+    // ID, so that the test doesn't add a node to that graph's entry.
     const bool force_collision =
         !registry().IsGraphTracked(exec_id, KeySpace::kTemplateGraph);
     if (force_collision) {
-      const CudaGraphAnnotationRegistry::TrackResult colliding_tmpl =
-          registry().TrackGraph(exec_id, TrackMode::kNewGraph,
-                                KeySpace::kTemplateGraph);
-      ASSERT_TRUE(registry().RegisterNodeAnnotation(
-          exec_id, colliding_tmpl.token, /*node_id=*/42,
-          "colliding_template_op", KeySpace::kTemplateGraph));
+      ASSERT_TRUE(registry().TrackGraph(exec_id, KeySpace::kTemplateGraph));
+      ASSERT_TRUE(registry().RegisterNodeAnnotation(exec_id, /*node_id=*/42,
+                                                    "colliding_template_op",
+                                                    KeySpace::kTemplateGraph));
     }
 
     // Invoke the pre-13.4 projection directly so it is exercised even when
